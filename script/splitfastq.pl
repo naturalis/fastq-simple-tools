@@ -9,7 +9,7 @@ warn "Note: this script assumes single-line FASTQ (as produced by the IonTorrent
 
 # process command line arguments
 my $mismatch = 4;
-my ( $infile, $help, $primerfile, $with_mid_labels, $test );
+my ( $infile, $help, $primerfile, $with_mid_labels, $test, $labels );
 GetOptions(
 	'primerfile=s'     => \$primerfile,
 	'infile=s'         => \$infile,
