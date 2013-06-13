@@ -24,18 +24,25 @@ sequences are then written to FASTA files, one file per locus.
 Note that the chromosome identifiers in the GFF3 file, the reference genome and the
 BAM files must match exactly.
 
+Here is a useful example run to clarify the arguments:
+
+ gene_extractor.pl -id mRNA:Solyc01g006550.2.1 -gff3 ITAG2.3_gene_models.gff3 \
+ -bam RF_001_SZAXPI008746-45.bam -ref S_lycopersicum_chromosomes.2.40.fa -verbose
+
 =head1 ARGUMENTS
 
 All arguments can both be provided in long form (--argument=value) and
-in the shortest unambiguous form (-a v).
+in the shortest unambiguous form (-a value).
 
 =over
 
-=item B<--id=gene id>
+=item B<--id=locus id>
 
-A gene identifier as it occurs in the GFF3 annotation file. This argument
+A locus identifier B<as it occurs in the GFF3 annotation file>. This argument
 can be used multiple times. Each occurrence will result in a separate FASTA
-files with the consensus sequences from all BAM files for that locus.
+files with the consensus sequences from all BAM files for that locus. Note
+that this script finds the identifiers in the rightmost column of the GFF3 file,
+as the values of the ID=... part of the description. 
 
 =item B<--gff3=gff3 annotation>
 
@@ -44,7 +51,8 @@ An annotation file in GFF3 format.
 =item B<--bam=bam file>
 
 BAM/SAM files from which the loci are to be extracted. This argument can be
-used multiple times.
+used multiple times. BAM files are indexed for fast random access, so if no
+*.bam.bai file exists, it is created.
 
 =item B<--refseq=FASTA file>
 
@@ -70,12 +78,12 @@ is assumed to be on the path.
 
 =item B<--vcfutils=location of vcfutils.pl>
 
-Location of the bcftools vcfutils.pl. This is optional, by default the program
+Location of the vcfutils.pl executable. This is optional, by default the program
 is assumed to be on the path.
 
 =item B<--workdir=working directory>
 
-Directory to write BED and FASTA files to. The default is the current working directory.
+Directory to write FASTA files to. The default is the current working directory.
 
 =item B<--help|?>
 
@@ -84,6 +92,17 @@ Prints this help message and quits.
 =item B<--verbose>
 
 Increments the verbosity level.
+
+=item B<--index>
+
+Index BAM file for fast random access. This is always done when a *.bam file does not 
+already have a *.bam.bai index associated with it. Adding this flag also forces indexing
+when such an index already exists.
+
+=item B<--revcom>
+
+If a locus is annotated to be on the - minus strand and this flag is set, the consensus
+sequence will be reversed and complemented when written to FASTA.
 
 =back
 
@@ -109,18 +128,13 @@ L<http://samtools.sourceforge.net/mpileup.shtml>
 
 =over
 
-=item BED files
-
-For each locus identifier supplied on the command line, a simple BED file will be created
-in the working directory. The BED file will have the name of the identifier with the 
-'.bed' suffix.
-
 =item FASTA files
 
 For each locus identifier supplied on the command line, a FASTA file will be created that
 contains the consensus sequences for that locus as extracted from all provided BAM files.
-The definition line of each FASTA record will consist of the locus ID, the chromosome and
-the start and stop coordinates all separated by spaces.
+The definition line of each FASTA record will consist of: the name of the source BAM file,
+the ID of the locus and the coordinates of the locus (as chr:start-stop), all separated
+by spaces.
 
 =back
 
@@ -143,13 +157,15 @@ my $help;                     # if true, print help message and quit
 my $verbosity = 1;            # logging level
 my $refseq;                   # the reference genome in FASTA format
 my $workdir = '.';            # working directory to write output files to
+my $index;                    # index BAM file for fast random access
+my $norevcom;                 # disable reverse complement consensus on - strand
 
 # basic logging functionality
 sub LOG ($$) {
 	my ($msg,$method) = @_;
 	my ( $package, $file1up, $line1up, $sub ) = caller( 2 );
 	my ( $pack0up, $file, $line, $sub0up )    = caller( 1 );
-	my $log = sprintf( "%s %s [%s, %s] - %s\n", uc $method, $sub || '', $file, $line, $msg );
+	my $log = sprintf( "%s %s [line %s] - %s\n", uc $method, $sub || '', $line, $msg );
 	print STDERR $log;
 }
 sub DEBUG ($) { LOG shift, 'DEBUG' if $verbosity >= 3 }
@@ -168,6 +184,8 @@ sub check_args {
 		'verbose+'   => \$verbosity,
 		'help|?'     => \$help,
 		'refseq=s'   => \$refseq,
+		'index'      => \$index,
+		'norevcom'   => \$norevcom,
 	);
 
 	# print help message and quit, if requested
@@ -183,6 +201,16 @@ sub check_args {
 	INFO "GFF3 file: $gff3";
 	INFO "BAM files: @bams";
 	INFO "samtools: $samtools";
+	INFO "bcftools: $bcftools";
+	INFO "vcfutils.pl: $vcfutils";
+
+	# check if BAM files were indexed
+	for my $bam ( @bams ) {
+		if ( not -e "${bam}.bai" or $index ) {
+			INFO "going to index BAM file $bam";
+			system( $samtools, 'index', $bam );  
+		}
+	}
 }
 
 # read annotation file, return extracted coordinates
@@ -190,6 +218,10 @@ sub read_gff3 {
 
 	# create mapping of requested IDs
 	my %ids = map { $_ => {} } @ids;
+
+	# keep track of IDs we've seen in GFF3
+	my %seen;
+
 	INFO "going to read GFF3 annotation file";
 	open my $fh, '<', $gff3 or die $!;
 	while(<$fh>) {
@@ -209,12 +241,19 @@ sub read_gff3 {
 			$ids{$id}->{'stop'}   = $stop;
 			$ids{$id}->{'strand'} = $strand;
 			$ids{$id}->{'chromo'} = $chromo;
+			$seen{$id}++;
 			INFO "found $id ($start..$stop) on the $strand strand";
 		}
 		else {
 			DEBUG "skipping feature $meta{ID}";
 		}
 	}
+	
+	# report on unseen IDs
+	for my $id ( @ids ) {
+		WARN "didn't find $id in $gff3" unless $seen{$id};
+	}
+
 	return %ids;
 }
 
@@ -226,12 +265,9 @@ sub write_consensus {
 	for my $id ( keys %args ) {
 		my %region = %{ $args{$id} };
 	
-		# we will now create a one-line BED file
-		my $bedline = join ' ', @region{qw[chromo start stop]};
-		my $bedfile = "${workdir}/${id}.bed";
-		open my $bedFH, '>', $bedfile or die $!;
-		print $bedFH $bedline, "\n";
-		INFO "wrote $bedfile containing '$bedline'";
+		# we will now create a coordinate set for the command line
+		my $coordinate = sprintf '%s:%i-%i', @region{qw[chromo start stop]};
+		INFO "will fetch coordinate set $coordinate";
 		
 		# instantiate the new FASTA file with consensus sequences
 		my $fasta = "${workdir}/${id}.fas";
@@ -243,14 +279,14 @@ sub write_consensus {
 		
 			# here we will open a handle to a pipe from which we read the FASTQ result
 			my $pipe    = "| $bcftools view -cg - | $vcfutils vcf2fq";
-			my $command = "$samtools mpileup -uf $refseq -l $bedfile $bam $pipe";
+			my $command = "$samtools mpileup -u -f $refseq -r \"$coordinate\" $bam $pipe";
+			INFO "going to run command $command";
 			my $output  = `$command`;
-			DEBUG "ran command '$command'";
 			
 			# now extract the subsequence from the FASTQ and write to FASTA
 			my $subseq = read_fastq( 'lines' => [ split /\n/, $output ], %region );
-			print $fastaFH ">$bam $id $bedline\n$subseq\n";
-			DEBUG "printed subseq to FASTA file: $subseq";
+			print $fastaFH ">$bam $id $coordinate\n$subseq\n";
+			INFO  "read ".length($subseq)." bases from FASTQ";
 		}
 		INFO "populated FASTA file $fasta";
 	}
@@ -296,15 +332,15 @@ sub read_fastq {
 					INFO "found chromosome of interest $id";
 					
 					# sequence is from 5' -->
-					if ( $args{'strand'} eq '+' ) {
-						INFO "locus is on + strand";
+					if ( $args{'strand'} eq '+' or $norevcom ) {
+						INFO "returning locus as is";
 						return substr $seq, $args{'start'}, $args{'stop'} - $args{'start'};
 					}
 					
 					# sequence is <-- 3'
 					else {
 						INFO "locus is on - strand, will reverse complement";
-						my $sub = substr reverse($seq), $args{'start'}, $args{'stop'} - $args{'start'};
+						my $sub = reverse( substr $seq, $args{'start'}, $args{'stop'} - $args{'start'} );						
 						$sub =~ tr/ACGTacgt/TGCAtgca/;
 						return $sub;
 					}
