@@ -99,10 +99,11 @@ Index BAM file for fast random access. This is always done when a *.bam file doe
 already have a *.bam.bai index associated with it. Adding this flag also forces indexing
 when such an index already exists.
 
-=item B<--revcom>
+=item B<--norevcom>
 
 If a locus is annotated to be on the - minus strand and this flag is set, the consensus
-sequence will be reversed and complemented when written to FASTA.
+sequence will normally be reversed and complemented when written to FASTA. This flag
+will prevent that behaviour and will return the consensus "as is".
 
 =back
 
