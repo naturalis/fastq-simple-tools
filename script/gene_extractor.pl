@@ -11,11 +11,11 @@ gene_extractor.pl - extracts genes from alignments
 
 =head1 DESCRIPTION
 
-This script extracts loci from aligned BAM/SAM files. The loci are provided on the command 
-line as identifiers that occur in a provided GFF3 annotation file, from which this script 
-extracts the coordinates (and strandedness). Subsequently, for each identified region this 
-script will create a consensus sequence for each provided BAM/SAM file. These consensus 
-sequences are then written to FASTA files, one file per locus.
+This script extracts a locus from aligned BAM/SAM files. The locus is provided on the 
+command line as an identifier that occur in a provided GFF3 annotation file, from which 
+this script extracts the coordinates (and strandedness). Subsequently, for the identified 
+region this script will create a consensus sequence for each provided BAM/SAM file. These 
+consensus sequences are then written to a FASTA file and a "quality" file.
 
 =head1 SYNOPSIS
 
@@ -38,9 +38,7 @@ in the shortest unambiguous form (-a value).
 
 =item B<--id=locus id>
 
-A locus identifier B<as it occurs in the GFF3 annotation file>. This argument
-can be used multiple times. Each occurrence will result in a separate FASTA
-files with the consensus sequences from all BAM files for that locus. Note
+A locus identifier B<as it occurs in the GFF3 annotation file>. Note
 that this script finds the identifiers in the rightmost column of the GFF3 file,
 as the values of the ID=... part of the description. 
 
@@ -148,7 +146,7 @@ a CC0 license.
 =cut
 
 # command line arguments, some with defaults
-my @ids;                      # array of gene IDs of interest
+my $id;                       # single gene IDs of interest
 my $gff3;                     # GFF3 annotation file
 my @bams;                     # array of BAM files from whence to extract
 my $samtools = 'samtools';    # default assumption is that it's on PATH
@@ -160,6 +158,8 @@ my $refseq;                   # the reference genome in FASTA format
 my $workdir = '.';            # working directory to write output files to
 my $index;                    # index BAM file for fast random access
 my $norevcom;                 # disable reverse complement consensus on - strand
+my $outfile;                  # output file, default is $workdir/$id.fa
+my $qualfile;                 # phred score file, default is $workdir/$id.qual
 
 # basic logging functionality
 sub LOG ($$) {
@@ -176,7 +176,7 @@ sub WARN ($)  { LOG shift, 'WARN'  if $verbosity >= 1 }
 # process command line arguments (void)
 sub check_args {
 	GetOptions(
-		'id=s'       => \@ids,
+		'id=s'       => \$id,
 		'gff3=s'     => \$gff3,
 		'bam=s'      => \@bams,
 		'samtools=s' => \$samtools,
@@ -187,18 +187,23 @@ sub check_args {
 		'refseq=s'   => \$refseq,
 		'index'      => \$index,
 		'norevcom'   => \$norevcom,
+		'outfile=s'  => \$outfile,
+		'qualfile=s' => \$qualfile,
 	);
+	
+	# expand comma separated values
+	@bams = grep { /\S/ } split /,/, join ',', @bams;
 
 	# print help message and quit, if requested
 	$help && pod2usage({ '-verbose' => $help });
 
 	# check sanity
-	if ( not @ids or not $gff3 or not @bams ) {
+	if ( not $id or not $gff3 or not @bams ) {
 		pod2usage({ '-verbose' => 1 });
 	}
 
 	# report provided arguments
-	INFO "provided IDs: @ids";
+	INFO "provided ID: $id";
 	INFO "GFF3 file: $gff3";
 	INFO "BAM files: @bams";
 	INFO "samtools: $samtools";
@@ -218,14 +223,14 @@ sub check_args {
 sub read_gff3 {
 
 	# create mapping of requested IDs
-	my %ids = map { $_ => {} } @ids;
+	my %ids = ( $id => {} );
 
 	# keep track of IDs we've seen in GFF3
 	my %seen;
 
 	INFO "going to read GFF3 annotation file";
 	open my $fh, '<', $gff3 or die $!;
-	while(<$fh>) {
+	GFF3: while(<$fh>) {
 		chomp;
 		next if /^#/; # skip comments and headers
 		
@@ -244,6 +249,7 @@ sub read_gff3 {
 			$ids{$id}->{'chromo'} = $chromo;
 			$seen{$id}++;
 			INFO "found $id ($start..$stop) on the $strand strand";
+			last GFF3;
 		}
 		else {
 			DEBUG "skipping feature $meta{ID}";
@@ -251,9 +257,7 @@ sub read_gff3 {
 	}
 	
 	# report on unseen IDs
-	for my $id ( @ids ) {
-		WARN "didn't find $id in $gff3" unless $seen{$id};
-	}
+	WARN "didn't find $id in $gff3" unless $seen{$id};
 
 	return %ids;
 }
@@ -271,12 +275,20 @@ sub write_consensus {
 		INFO "will fetch coordinate set $coordinate";
 		
 		# instantiate the new FASTA file with consensus sequences
-		my $fasta = "${workdir}/${id}.fas";
+		my $fasta = $outfile || "${workdir}/${id}.fas";
 		open my $fastaFH, '>', $fasta or die $!;
 		INFO "instantiated FASTA file $fasta";
 		
+		# instantiate the new quality file with PHRED scores
+		my $qual = $qualfile || "${workdir}/${id}.qual";
+		open my $qualFH, '>', $qual or die $!;
+		INFO "instantiated quality file $qual";
+		
 		# iterate over the BAM files
 		for my $bam ( @bams ) {
+		
+			# make the header
+			my $header = make_header($bam);
 		
 			# here we will open a handle to a pipe from which we read the FASTQ result
 			my $pipe    = "| $bcftools view -cg - | $vcfutils vcf2fq";
@@ -284,79 +296,150 @@ sub write_consensus {
 			INFO "going to run command $command";
 			my $output  = `$command`;
 			
-			# now extract the subsequence from the FASTQ and write to FASTA
-			my $subseq = read_fastq( 'lines' => [ split /\n/, $output ], %region );
-			print $fastaFH ">$bam $id $coordinate\n$subseq\n";
-			INFO  "read ".length($subseq)." bases from FASTQ";
+			# now extract the subsequence and quality from the FASTQ
+			my ($seq,$phred) = read_fastq( 'lines' => [ split /\n/, $output ], %region );
+						
+			# write sequence record
+			print $fastaFH ">$header $id $coordinate\n$seq\n";
+			
+			# write quality record
+			my @qual = map { ord($_) - 33 } split //, $phred;
+			print $qualFH  ">$header $id $coordinate\n@qual\n";
 		}
+		
+		# make reference header
+		my $refheader = make_header($refseq);
+		
+		# extract the reference locus
+		my $reflocus = extract_reference(%region);
+		print $fastaFH ">$refheader $id $coordinate\n$reflocus\n";
+		
+		# make reference dummy quality score
+		my @refqual;
+		push @refqual, 93 for 1 .. length $reflocus;
+		print $qualFH ">$refheader $id $coordinate\n@refqual\n";
+		
 		INFO "populated FASTA file $fasta";
 	}
 }
 
+sub make_header {
+	my $filename = shift;
+	
+	# strip path, use base name
+	$filename =~ s/.+\///;
+	
+	# strip everything after first underscore
+	$filename =~ s/_.+//;
+	
+	# done
+	return $filename;
+}
+
+# extracts locus from reference sequence
+sub extract_reference {
+	my %region = @_;
+	
+	INFO "going to fetch %region from $refseq";
+	open my $fh, '<', $refseq or die $!;
+	my $seq;
+	my $read;
+	LINE: while(<$fh>) {
+		chomp;
+		
+		# wrong chromosome
+		if ( /^>/ && $_ !~ /^>$region{chromo}\s*/ ) {
+			$read = 0;
+			next LINE;
+		}
+		
+		# right chromosome
+		if ( /^>$region{chromo}\s*/ ) {
+			$read = 1;
+			INFO "found $region{chromo} in $refseq";
+			next LINE;
+		}
+		
+		# right sequence
+		if ( $read && $_ !~ /^>/ ) {
+			$seq .= $_;
+		}
+	}
+	
+	# extract and reverse complement
+	return extract_seq($seq,0,%region);	
+}
+
+# extracts a subsequence from a seq, reverse complements if need be
+sub extract_seq {
+	my ($seq,$isphred,%args) = @_;
+	
+	# extract sequence
+	if ( $args{'strand'} eq '+' or $norevcom ) {
+		INFO "returning locus as is";
+		return substr $seq, $args{'start'}, $args{'stop'} - $args{'start'};		
+	}
+	
+	# sequence is <-- 3'
+	else {
+		INFO "locus is on - strand, will reverse complement";
+		my $sub = reverse( substr $seq, $args{'start'}, $args{'stop'} - $args{'start'} );						
+		$sub =~ tr/ACGTacgt/TGCAtgca/ unless $isphred;
+		return $sub;
+	}	
+}
+
 # reads from FASTQ handle, returns seq from provided coordinates
+# the data will consist of a single FASTQ record so we do the extracting
+# after the record was read
 sub read_fastq {
 	my %args = @_; # e.g. fh => foo, chromo => bar, start => baz, stop => quux
 	INFO "going to read FASTQ data";
 	
-	my ( $seqlength, $phredlength ) = ( 0, 0 );
-	my ( $id, $seq, $plus );
-	RECORD: for my $line ( @{ $args{'lines'} } ) {
+	my ( $readseq, $readphred );
+	my ( $id, $seq, $phred );
+	LINE: for my $line ( @{ $args{'lines'} } ) {
 		chomp $line;
 		
-		# find the FASTQ id line
-		if ( not $id and $line =~ /^\@(.+)$/ ) {
+		# found the FASTQ id line
+		if ( $line =~ /^\@(.+)$/ ) {
 			$id = $1;
-			INFO "found record ID $id";
+			$readseq   = 1;
+			$readphred = 0;
+			$seq       = '';
+			INFO "found record ID $id, going to read sequence";
+			next LINE;
 		}
 		
-		# concatenate the sequences, output is multiline!
-		elsif ( $id and not $plus and $line !~ m/^\+/ ) {
+		# found the FASTQ plus line
+		elsif ( $line =~ /^\+/ and not $readphred ) {
+			$readseq   = 0;
+			$readphred = 1;
+			$phred     = '';
+			INFO "found plus line, going to read sequence quality";
+			next LINE;
+		}
+		
+		# concatenate sequence
+		elsif ( $readseq ) {
 			$seq .= $line;
-			$seqlength++;
+			next LINE;
 		}
 		
-		# check for plus line
-		elsif ( $id and $seq and not $plus and $line =~  m/^\+/ ) {
-			$plus++;
-			INFO "found + line";
-		}
-		
-		# check for end of phred lines, output is multiline!
-		elsif ( $id and $seq and $plus ) {
-			if ( $phredlength < ( $seqlength - 1 ) ) {
-				$phredlength++;
-			}
-			else {
-			
-				# return wanted result or continue to next chromosome
-				if ( $id eq $args{'chromo'} ) {
-					INFO "found chromosome of interest $id";
-					
-					# sequence is from 5' -->
-					if ( $args{'strand'} eq '+' or $norevcom ) {
-						INFO "returning locus as is";
-						return substr $seq, $args{'start'}, $args{'stop'} - $args{'start'};
-					}
-					
-					# sequence is <-- 3'
-					else {
-						INFO "locus is on - strand, will reverse complement";
-						my $sub = reverse( substr $seq, $args{'start'}, $args{'stop'} - $args{'start'} );						
-						$sub =~ tr/ACGTacgt/TGCAtgca/;
-						return $sub;
-					}
-				}
-				else {
-					INFO "ignoring: chromosome $id != $args{chromo}";
-					undef $id;
-					undef $seq;
-					undef $plus;
-					( $seqlength, $phredlength ) = ( 0, 0 );
-					next RECORD;
-				}
-			}
+		# concatenate quality line
+		elsif ( $readphred ) {
+			$phred .= $line;
+			next LINE;
 		}
 	}
+	
+	# extract and reverse complement
+	my $subseq = extract_seq($seq,0,%args);
+	
+	# extract and reverse, but not complement	
+	my $subphred = extract_seq($phred,1,%args);
+	
+	return $subseq, $subphred;
 }
 
 # to aid comprehension, this script is organized in a main that calls the other subs. 
