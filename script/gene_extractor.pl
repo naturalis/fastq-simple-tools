@@ -36,6 +36,10 @@ in the shortest unambiguous form (-a value).
 
 =over
 
+=item B<--interval=interval>
+
+A genomic interval formatted as chromosome:start-end
+
 =item B<--id=locus id>
 
 A locus identifier B<as it occurs in the GFF3 annotation file>. Note
@@ -160,6 +164,7 @@ my $index;                    # index BAM file for fast random access
 my $norevcom;                 # disable reverse complement consensus on - strand
 my $outfile;                  # output file, default is $workdir/$id.fa
 my $qualfile;                 # phred score file, default is $workdir/$id.qual
+my $interval;                 # interval, use instead of $id and $gff3
 
 # basic logging functionality
 sub LOG ($$) {
@@ -189,6 +194,7 @@ sub check_args {
 		'norevcom'   => \$norevcom,
 		'outfile=s'  => \$outfile,
 		'qualfile=s' => \$qualfile,
+		'interval=s' => \$interval,
 	);
 	
 	# expand comma separated values
@@ -198,13 +204,18 @@ sub check_args {
 	$help && pod2usage({ '-verbose' => $help });
 
 	# check sanity
-	if ( not $id or not $gff3 or not @bams ) {
+	if ( not ( $interval xor ( $id and $gff3 ) ) or not @bams ) {
 		pod2usage({ '-verbose' => 1 });
 	}
 
 	# report provided arguments
-	INFO "provided ID: $id";
-	INFO "GFF3 file: $gff3";
+	if ( $id and $gff3 ) {
+		INFO "provided ID: $id";
+		INFO "GFF3 file: $gff3";
+	}
+	else {
+		INFO "interval: $interval";
+	}
 	INFO "BAM files: @bams";
 	INFO "samtools: $samtools";
 	INFO "bcftools: $bcftools";
@@ -446,7 +457,23 @@ sub read_fastq {
 # start here and drill down if you're trying to make sense of this.
 sub main {
 	check_args();
-	my %coordinates = read_gff3();
+	my %coordinates;
+	if ( $interval ) {
+		if ( $interval =~ /^([^:]+):(\d+)-(\d+)$/ ) {
+			my ( $chromo, $start, $end ) = ( $1, $2, $3 );
+			my $name = $interval;
+			$name =~ s/:/_/;
+			$coordinates{$name} = {
+				'chromo' => $chromo,
+				'start'  => $start,
+				'stop'   => $end,
+				'strand' => '+',
+			};
+		}
+	}
+	else {
+		%coordinates = read_gff3();
+	}	
 	write_consensus(%coordinates);
 }
 main();
